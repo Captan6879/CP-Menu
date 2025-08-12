@@ -1,0 +1,283 @@
+--
+-- Aimbot-like UI (Safe, Educational) for Roblox — LocalScript
+-- Purpose: a training / demonstration tool that helps you practice aiming
+-- IMPORTANT: This script is intentionally *not* a cheat for multiplayer players.
+-- It only spawns local dummy targets and only smooths the camera while the
+-- user holds the right mouse button. Do NOT use this against other real players.
+--
+-- Usage: paste this as a LocalScript inside StarterPlayerScripts.
+--
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+-- ====== Configurable settings ======
+local CONFIG = {
+    DummyCount = 6,            -- number of local dummy targets to spawn
+    DummyDistance = 60,        -- radius to spawn dummies around spawn point
+    SmoothSpeed = 8,           -- larger -> faster smoothing (camera lerp)
+    DefaultFOV = 90,           -- visual FOV circle radius in pixels
+}
+
+-- ====== Helper functions ======
+local function createGui()
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "AimTrainUI"
+    screenGui.ResetOnSpawn = false
+
+    local main = Instance.new("Frame")
+    main.Name = "Main"
+    main.Size = UDim2.new(0, 340, 0, 120)
+    main.Position = UDim2.new(0.5, -170, 0.85, -60)
+    main.AnchorPoint = Vector2.new(0.5, 0.5)
+    main.BackgroundTransparency = 0.06
+    main.BackgroundColor3 = Color3.fromRGB(20,20,25)
+    main.BorderSizePixel = 0
+    main.Parent = screenGui
+
+    local uic = Instance.new("UICorner", main)
+    uic.CornerRadius = UDim.new(0, 14)
+
+    local title = Instance.new("TextLabel", main)
+    title.Size = UDim2.new(1, -20, 0, 32)
+    title.Position = UDim2.new(0, 10, 0, 8)
+    title.BackgroundTransparency = 1
+    title.Text = "AIM TRAIN — Practice Mode"
+    title.TextSize = 20
+    title.Font = Enum.Font.GothamBold
+    title.TextColor3 = Color3.fromRGB(230,230,230)
+    title.TextXAlignment = Enum.TextXAlignment.Left
+
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Name = "Toggle"
+    toggleBtn.Parent = main
+    toggleBtn.Size = UDim2.new(0, 110, 0, 36)
+    toggleBtn.Position = UDim2.new(1, -120, 0, 12)
+    toggleBtn.AnchorPoint = Vector2.new(1, 0)
+    toggleBtn.Text = "Enable"
+    toggleBtn.Font = Enum.Font.Gotham
+    toggleBtn.TextSize = 16
+    toggleBtn.BackgroundColor3 = Color3.fromRGB(40,40,50)
+    toggleBtn.TextColor3 = Color3.fromRGB(230,230,230)
+    toggleBtn.BorderSizePixel = 0
+
+    local toggleCorner = Instance.new("UICorner", toggleBtn)
+    toggleCorner.CornerRadius = UDim.new(0, 10)
+
+    local fovLabel = Instance.new("TextLabel", main)
+    fovLabel.Size = UDim2.new(0, 90, 0, 20)
+    fovLabel.Position = UDim2.new(0, 14, 0, 52)
+    fovLabel.BackgroundTransparency = 1
+    fovLabel.Text = "FOV: " .. tostring(CONFIG.DefaultFOV)
+    fovLabel.Font = Enum.Font.Gotham
+    fovLabel.TextSize = 14
+    fovLabel.TextColor3 = Color3.fromRGB(200,200,200)
+    fovLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+    -- Slider
+    local sliderBar = Instance.new("Frame", main)
+    sliderBar.Name = "SliderBar"
+    sliderBar.Size = UDim2.new(0, 200, 0, 16)
+    sliderBar.Position = UDim2.new(0, 110, 0, 50)
+    sliderBar.BackgroundColor3 = Color3.fromRGB(50,50,60)
+    sliderBar.BorderSizePixel = 0
+
+    local sliderCorner = Instance.new("UICorner", sliderBar)
+    sliderCorner.CornerRadius = UDim.new(0, 8)
+
+    local knob = Instance.new("Frame", sliderBar)
+    knob.Name = "Knob"
+    knob.Size = UDim2.new(0, 14, 1, 0)
+    knob.Position = UDim2.new(0.5, -7, 0, 0)
+    knob.BackgroundColor3 = Color3.fromRGB(170,110,255)
+    knob.BorderSizePixel = 0
+    local knobCorner = Instance.new("UICorner", knob)
+    knobCorner.CornerRadius = UDim.new(0, 8)
+
+    -- Style: small caption
+    local hint = Instance.new("TextLabel", main)
+    hint.Size = UDim2.new(1, -20, 0, 20)
+    hint.Position = UDim2.new(0, 10, 0, 82)
+    hint.BackgroundTransparency = 1
+    hint.Text = "Hold Right Mouse Button to assist aim at dummies — safe for training"
+    hint.Font = Enum.Font.Gotham
+    hint.TextSize = 12
+    hint.TextColor3 = Color3.fromRGB(170,170,170)
+    hint.TextXAlignment = Enum.TextXAlignment.Left
+
+    screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+    return {
+        ScreenGui = screenGui,
+        Toggle = toggleBtn,
+        SliderBar = sliderBar,
+        Knob = knob,
+        FovLabel = fovLabel,
+    }
+end
+
+local ui = createGui()
+
+-- ====== Spawn safe local dummy targets ======
+local function spawnDummies(count, radius)
+    local folder = workspace:FindFirstChild("AimDummies") or Instance.new("Folder", workspace)
+    folder.Name = "AimDummies"
+    -- clear existing
+    for i, v in ipairs(folder:GetChildren()) do
+        v:Destroy()
+    end
+
+    local origin = (LocalPlayer.Character and LocalPlayer.Character.PrimaryPart and LocalPlayer.Character.PrimaryPart.Position) or (Camera and Camera.CFrame.Position) or Vector3.new(0,5,0)
+
+    for i = 1, count do
+        local angle = math.rad((i-1) * (360/count))
+        local pos = origin + Vector3.new(math.cos(angle)*radius, math.random(2, 8), math.sin(angle)*radius)
+
+        local part = Instance.new("Part")
+        part.Size = Vector3.new(2,2,2)
+        part.Position = pos
+        part.Anchored = true
+        part.CanCollide = false
+        part.Name = "AimDummy"
+        part.Parent = folder
+
+        local beacon = Instance.new("PointLight", part)
+        beacon.Range = 12
+        beacon.Brightness = 2
+
+        local billboard = Instance.new("BillboardGui", part)
+        billboard.Size = UDim2.new(0, 120, 0, 32)
+        billboard.AlwaysOnTop = true
+        local label = Instance.new("TextLabel", billboard)
+        label.Size = UDim2.new(1,0,1,0)
+        label.BackgroundTransparency = 1
+        label.Text = "Dummy" .. tostring(i)
+        label.TextColor3 = Color3.fromRGB(240,240,240)
+        label.Font = Enum.Font.Gotham
+        label.TextSize = 16
+    end
+end
+
+spawnDummies(CONFIG.DummyCount, CONFIG.DummyDistance)
+
+-- ====== Aim logic (local-only, non-harmful) ======
+local enabled = false
+local holding = false
+local fovPixels = CONFIG.DefaultFOV
+
+-- Convert FOV pixels to a cone check in world space
+local function isInScreenFOV(targetPos, fovPixels)
+    local screenPos, onScreen = Camera:WorldToViewportPoint(targetPos)
+    if not onScreen then return false, nil end
+    local centerX, centerY = Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2
+    local dx = screenPos.X - centerX
+    local dy = screenPos.Y - centerY
+    local dist = math.sqrt(dx*dx + dy*dy)
+    return dist <= fovPixels, screenPos
+end
+
+local function getClosestDummy()
+    local best
+    local bestDist = math.huge
+    local dummies = workspace:FindFirstChild("AimDummies")
+    if not dummies then return nil end
+    for _, part in ipairs(dummies:GetChildren()) do
+        if part:IsA("BasePart") then
+            local ok, screenPos = isInScreenFOV(part.Position, fovPixels)
+            if ok then
+                local dx = screenPos.X - Camera.ViewportSize.X/2
+                local dy = screenPos.Y - Camera.ViewportSize.Y/2
+                local dist = math.sqrt(dx*dx + dy*dy)
+                if dist < bestDist then
+                    bestDist = dist
+                    best = part
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- Smoothly move camera's look direction towards target (local only)
+local function smoothLookAt(targetPos, dt)
+    local camPos = Camera.CFrame.Position
+    local desired = CFrame.new(camPos, targetPos)
+    -- simple lerp on CFrame: use TweenService for nicer smoothing
+    local current = Camera.CFrame
+    local alpha = math.clamp(CONFIG.SmoothSpeed * dt, 0, 1)
+    Camera.CFrame = current:Lerp(desired, alpha)
+end
+
+-- UI interactivity: toggle & slider
+ui.Toggle.MouseButton1Click:Connect(function()
+    enabled = not enabled
+    ui.Toggle.Text = enabled and "Enabled" or "Enable"
+    ui.Toggle.BackgroundColor3 = enabled and Color3.fromRGB(30,150,100) or Color3.fromRGB(40,40,50)
+end)
+
+-- Slider drag
+local dragging = false
+local sliderPos = 0.5 -- between 0 and 1
+
+ui.Knob.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = false
+    end
+end)
+
+RunService.RenderStepped:Connect(function()
+    if dragging then
+        local mouse = LocalPlayer:GetMouse()
+        local bar = ui.SliderBar
+        local relativeX = math.clamp(mouse.X - bar.AbsolutePosition.X, 0, bar.AbsoluteSize.X)
+        sliderPos = relativeX / bar.AbsoluteSize.X
+        ui.Knob.Position = UDim2.new(sliderPos, -7, 0, 0)
+        fovPixels = math.floor(30 + sliderPos * 200) -- 30..230 pixels
+        ui.FovLabel.Text = "FOV: " .. tostring(fovPixels)
+    end
+end)
+
+-- Input: hold right mouse to assist
+UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton2 then
+        holding = true
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton2 then
+        holding = false
+    end
+end)
+
+-- Main loop
+RunService.RenderStepped:Connect(function(dt)
+    if enabled and holding then
+        local target = getClosestDummy()
+        if target then
+            smoothLookAt(target.Position, dt)
+        end
+    end
+end)
+
+-- Safety: Clean up when player leaves
+LocalPlayer.AncestryChanged:Connect(function()
+    if not LocalPlayer:IsDescendantOf(game) then
+        local gui = LocalPlayer:FindFirstChild("PlayerGui")
+        if gui then
+            local g = gui:FindFirstChild("AimTrainUI")
+            if g then g:Destroy() end
+        end
+    end
+end)
+
+-- End of script
