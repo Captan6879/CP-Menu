@@ -1,497 +1,339 @@
+-- Roblox — ChatGPT-style Integration (Client UI + Server Proxy)
+-- FILE: Roblox_ChatGPT5_Integration.lua
+-- This single file bundles multiple scripts (ModuleScript, Server Script, LocalScript) you should split
+-- into appropriate places in your Roblox project as described below.
 --
--- Aimbot-like UI (Safe, Educational) for Roblox — LocalScript (Draggable + Extended Features)
--- Purpose: a training / demonstration tool that helps you practice aiming
--- THIS SCRIPT IS INTENTIONALLY LOCAL-ONLY and ONLY INTERACTS WITH DUMMY TARGETS spawned by the script.
--- DO NOT use this against real players. It's meant for private practice and learning.
+-- IMPORTANT SAFETY & SETUP NOTES
+-- 1) Never put your OpenAI API key inside a LocalScript or anywhere accessible to clients.
+--    Store it in a Server Script Module (Server-only) or a secure server environment.
+-- 2) Enable HttpService in Studio: Home > Game Settings > Security > Enable Http Requests
+-- 3) This example calls an OpenAI-like HTTP endpoint. Replace MODEL_NAME and ENDPOINT with the
+--    correct values from OpenAI docs. The code below uses a generic Chat Completions POST.
+-- 4) Watch out for costs and rate limits. Implement throttling/quotas for players.
+-- 5) This integration is intended for developer-owned worlds where you control both client and server.
 --
--- Usage: paste this as a LocalScript inside StarterPlayerScripts.
+-- HOW TO SPLIT INTO ROBLOX ASSETS
+-- 1) Create a ModuleScript in ServerScriptService named `OpenAI_Module` and paste the OpenAI module code.
+-- 2) Create a Script in ServerScriptService named `ChatServer` and paste the server handler code.
+-- 3) Create a RemoteFunction in ReplicatedStorage named `ChatRequestFunction`.
+-- 4) Create a ScreenGui + LocalScript in StarterPlayerScripts named `ChatClient` and paste the client UI code.
 --
+-- -----------------------------------------------------------------------------
+-- [A] ModuleScript (ServerScriptService/OpenAI_Module)
+-- Put only on the server. Add your API key inside the module (or require from a secure source).
+-- -----------------------------------------------------------------------------
+local OpenAIModule = {}
 
+local HttpService = game:GetService("HttpService")
+
+-- CONFIG: change these to match your OpenAI / provider settings
+OpenAIModule.API_ENDPOINT = "https://api.openai.com/v1/chat/completions" -- example
+OpenAIModule.MODEL = "YOUR_MODEL_NAME" -- e.g. "gpt-5-thinking-mini" or whichever model you have access to
+OpenAIModule.API_KEY = "REPLACE_WITH_YOUR_API_KEY" -- **DO NOT** put this in a LocalScript!
+
+-- Simple helper for POSTing a chat request
+function OpenAIModule:RequestChat(systemPrompt, userMessage)
+    assert(type(systemPrompt) == "string")
+    assert(type(userMessage) == "string")
+
+    -- Build the payload following chat-completions style
+    local body = {
+        model = self.MODEL,
+        messages = {
+            { role = "system", content = systemPrompt },
+            { role = "user", content = userMessage },
+        },
+        max_tokens = 600,
+        temperature = 0.7,
+    }
+
+    local jsonBody = HttpService:JSONEncode(body)
+
+    local headers = {
+        ["Content-Type"] = "application/json",
+        ["Authorization"] = "Bearer " .. self.API_KEY,
+    }
+
+    -- RequestAsync gives more control; using pcall to catch issues
+    local ok, res = pcall(function()
+        return HttpService:RequestAsync({
+            Url = self.API_ENDPOINT,
+            Method = "POST",
+            Headers = headers,
+            Body = jsonBody,
+            Timeout = 20,
+        })
+    end)
+
+    if not ok then
+        return false, "HTTP request failed: " .. tostring(res)
+    end
+
+    if res.Success then
+        -- parse response body
+        local decoded = HttpService:JSONDecode(res.Body)
+        -- navigate typical response structure -- adapt if provider differs
+        local content = nil
+        if decoded and decoded.choices and #decoded.choices > 0 and decoded.choices[1].message then
+            content = decoded.choices[1].message.content
+        elseif decoded and decoded.choices and #decoded.choices > 0 and decoded.choices[1].text then
+            content = decoded.choices[1].text
+        end
+        return true, content or "(no content)"
+    else
+        return false, "API error: " .. tostring(res.StatusCode) .. " - " .. tostring(res.Body)
+    end
+end
+
+return OpenAIModule
+
+-- -----------------------------------------------------------------------------
+-- [B] Server Script (ServerScriptService/ChatServer)
+-- Handles requests from clients via RemoteFunction and proxies them to OpenAI_Module
+-- -----------------------------------------------------------------------------
+--[[
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
+
+local ChatRequestFunction = ReplicatedStorage:WaitForChild("ChatRequestFunction") -- RemoteFunction
+local OpenAIModule = require(game:GetService("ServerScriptService"):WaitForChild("OpenAI_Module"))
+
+-- Simple rate-limiter table (per-player)
+local lastRequestAt = {}
+local MIN_INTERVAL = 1.2 -- seconds between requests per player (adjust as needed)
+
+ChatRequestFunction.OnServerInvoke = function(player, userMessage)
+    if type(userMessage) ~= "string" then
+        return { ok = false, error = "Invalid message" }
+    end
+
+    local now = tick()
+    local last = lastRequestAt[player.UserId]
+    if last and now - last < MIN_INTERVAL then
+        return { ok = false, error = "Too many requests. Slow down." }
+    end
+    lastRequestAt[player.UserId] = now
+
+    -- Basic sanitization: length limits
+    if #userMessage > 2000 then
+        return { ok = false, error = "Message too long" }
+    end
+
+    -- Build a system prompt describing the assistant persona and constraints
+    local systemPrompt = "You are an in-game assistant for a Roblox world. Keep answers concise and safe for general audiences. Avoid giving cheats or exploit instructions."
+
+    local ok, result = OpenAIModule:RequestChat(systemPrompt, userMessage)
+    if not ok then
+        return { ok = false, error = result }
+    end
+
+    return { ok = true, text = result }
+end
+]]-- end server script
+
+-- -----------------------------------------------------------------------------
+-- [C] Client UI (StarterPlayerScripts: LocalScript + ScreenGui creation)
+-- A stylish floating chat block that calls the RemoteFunction to get replies.
+-- -----------------------------------------------------------------------------
+--[[
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
+
 local LocalPlayer = Players.LocalPlayer
-local Camera = workspace.CurrentCamera
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
--- ====== Configurable settings ======
-local CONFIG = {
-    DummyCount = 6,            -- number of local dummy targets to spawn
-    DummyDistance = 60,        -- radius to spawn dummies around spawn point
-    SmoothSpeed = 8,           -- larger -> faster smoothing (camera lerp)
-    DefaultFOV = 90,           -- visual FOV radius in pixels
-    AutoRespawn = true,        -- respawn dummies when destroyed
-}
+-- Ensure RemoteFunction exists
+local ChatRequestFunction = ReplicatedStorage:WaitForChild("ChatRequestFunction")
 
--- ====== Utility ======
-local function clamp(v,a,b) return math.max(a, math.min(b, v)) end
+-- Build GUI
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "ChatGPT_UI"
+screenGui.ResetOnSpawn = false
 
--- ====== Create UI ======
-local function createGui()
-    local screenGui = Instance.new("ScreenGui")
-    screenGui.Name = "AimTrainUI"
-    screenGui.ResetOnSpawn = false
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.new(0, 420, 0, 140)
+main.Position = UDim2.new(0.5, -210, 0.25, -70)
+main.AnchorPoint = Vector2.new(0.5, 0.5)
+main.BackgroundColor3 = Color3.fromRGB(12,12,16)
+main.BackgroundTransparency = 0
+main.BorderSizePixel = 0
+main.Parent = screenGui
+local mainCorner = Instance.new("UICorner", main)
+mainCorner.CornerRadius = UDim.new(0, 12)
 
-    local main = Instance.new("Frame")
-    main.Name = "Main"
-    main.Size = UDim2.new(0, 380, 0, 160)
-    main.Position = UDim2.new(0.5, -190, 0.85, -80)
-    main.AnchorPoint = Vector2.new(0.5, 0.5)
-    main.BackgroundTransparency = 0.04
-    main.BackgroundColor3 = Color3.fromRGB(18,18,22)
-    main.BorderSizePixel = 0
-    main.Parent = screenGui
+-- Header (for dragging) and title
+local header = Instance.new("Frame", main)
+header.Size = UDim2.new(1, 0, 0, 34)
+header.Position = UDim2.new(0,0,0,0)
+header.BackgroundTransparency = 1
 
-    local uic = Instance.new("UICorner", main)
-    uic.CornerRadius = UDim.new(0, 14)
+local title = Instance.new("TextLabel", header)
+title.Size = UDim2.new(0.6, -12, 1, 0)
+title.Position = UDim2.new(0, 12, 0, 0)
+title.BackgroundTransparency = 1
+title.Text = "GPT-5 Assistant"
+title.Font = Enum.Font.GothamBold
+title.TextSize = 18
+title.TextColor3 = Color3.fromRGB(235,235,235)
 
-    local header = Instance.new("Frame", main)
-    header.Name = "Header"
-    header.Size = UDim2.new(1, 0, 0, 36)
-    header.Position = UDim2.new(0, 0, 0, 0)
-    header.BackgroundTransparency = 1
+-- small status icon
+local status = Instance.new("Frame", header)
+status.Size = UDim2.new(0, 10, 0, 10)
+status.Position = UDim2.new(0.6, 0, 0.5, -5)
+status.BackgroundColor3 = Color3.fromRGB(80,200,120)
+local statusCorner = Instance.new("UICorner", status)
+statusCorner.CornerRadius = UDim.new(0, 6)
 
-    local title = Instance.new("TextLabel", header)
-    title.Size = UDim2.new(1, -20, 1, 0)
-    title.Position = UDim2.new(0, 10, 0, 0)
-    title.BackgroundTransparency = 1
-    title.Text = "AIM TRAIN — Practice Mode"
-    title.TextSize = 18
-    title.Font = Enum.Font.GothamBold
-    title.TextColor3 = Color3.fromRGB(230,230,230)
-    title.TextXAlignment = Enum.TextXAlignment.Left
+-- close/minimize buttons
+local closeBtn = Instance.new("TextButton", header)
+closeBtn.Size = UDim2.new(0, 30, 0, 24)
+closeBtn.Position = UDim2.new(1, -38, 0.5, -12)
+closeBtn.Text = "—"
+closeBtn.Font = Enum.Font.Gotham
+closeBtn.TextSize = 18
+closeBtn.BackgroundColor3 = Color3.fromRGB(30,30,34)
+closeBtn.BorderSizePixel = 0
+local closeCorner = Instance.new("UICorner", closeBtn)
+closeCorner.CornerRadius = UDim.new(0,6)
 
-    local closeBtn = Instance.new("TextButton", header)
-    closeBtn.Name = "Close"
-    closeBtn.Size = UDim2.new(0, 34, 0, 26)
-    closeBtn.Position = UDim2.new(1, -40, 0, 5)
-    closeBtn.AnchorPoint = Vector2.new(0, 0)
-    closeBtn.Text = "×"
-    closeBtn.Font = Enum.Font.Gotham
-    closeBtn.TextSize = 20
-    closeBtn.BackgroundTransparency = 0
-    closeBtn.BackgroundColor3 = Color3.fromRGB(40,40,50)
-    closeBtn.TextColor3 = Color3.fromRGB(240,240,240)
-    closeBtn.BorderSizePixel = 0
-    local closeCorner = Instance.new("UICorner", closeBtn)
-    closeCorner.CornerRadius = UDim.new(0, 6)
+-- Body: scrollable chat area
+local chatArea = Instance.new("ScrollingFrame", main)
+chatArea.Size = UDim2.new(1, -24, 1, -76)
+chatArea.Position = UDim2.new(0, 12, 0, 44)
+chatArea.BackgroundTransparency = 1
+chatArea.ScrollBarThickness = 6
+chatArea.CanvasSize = UDim2.new(0,0,0,0)
+chatArea.AutomaticCanvasSize = Enum.AutomaticSize.Y
 
-    -- Left column (controls)
-    local left = Instance.new("Frame", main)
-    left.Name = "Left"
-    left.Size = UDim2.new(0, 180, 1, -46)
-    left.Position = UDim2.new(0, 10, 0, 42)
-    left.BackgroundTransparency = 1
+local uiList = Instance.new("UIListLayout", chatArea)
+uiList.SortOrder = Enum.SortOrder.LayoutOrder
+uiList.Padding = UDim.new(0,6)
 
-    local right = Instance.new("Frame", main)
-    right.Name = "Right"
-    right.Size = UDim2.new(1, -210, 1, -46)
-    right.Position = UDim2.new(0, 200, 0, 42)
-    right.BackgroundTransparency = 1
+-- Input Box
+local inputBox = Instance.new("TextBox", main)
+inputBox.Size = UDim2.new(1, -24, 0, 28)
+inputBox.Position = UDim2.new(0, 12, 1, -34)
+inputBox.ClearTextOnFocus = false
+inputBox.Text = "พิมพ์คำถามของคุณ..."
+inputBox.Font = Enum.Font.Gotham
+inputBox.TextSize = 16
+inputBox.TextColor3 = Color3.fromRGB(230,230,230)
+inputBox.BackgroundColor3 = Color3.fromRGB(24,24,28)
+inputBox.BorderSizePixel = 0
+local inputCorner = Instance.new("UICorner", inputBox)
+inputCorner.CornerRadius = UDim.new(0,8)
 
-    -- Buttons & toggles
-    local function makeButton(parent, name, y, text)
-        local b = Instance.new("TextButton", parent)
-        b.Name = name
-        b.Size = UDim2.new(1, 0, 0, 28)
-        b.Position = UDim2.new(0, 0, 0, y)
-        b.Text = text
-        b.Font = Enum.Font.Gotham
-        b.TextSize = 14
-        b.BackgroundColor3 = Color3.fromRGB(42,42,54)
-        b.TextColor3 = Color3.fromRGB(230,230,230)
-        b.BorderSizePixel = 0
-        local c = Instance.new("UICorner", b)
-        c.CornerRadius = UDim.new(0, 6)
-        return b
-    end
+-- Helper: add chat bubble
+local function addBubble(text, fromPlayer)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, 0, 0, 0)
+    frame.BackgroundTransparency = 1
+    frame.LayoutOrder = #chatArea:GetChildren() + 1
 
-    local toggleBtn = makeButton(left, "ToggleAimbot", 0, "Enable Aimbot")
-    local autoFireBtn = makeButton(left, "AutoFire", 36, "Auto-Fire (simulated)")
-    local spawnBtn = makeButton(left, "RespawnDummies", 72, "Respawn Dummies")
-    local moveBtn = makeButton(left, "ToggleMoving", 108, "Toggle Moving Targets")
+    local label = Instance.new("TextLabel", frame)
+    label.Size = UDim2.new(1, -12, 0, 0)
+    label.Position = UDim2.new(0,6,0,0)
+    label.BackgroundTransparency = 1
+    label.TextWrapped = true
+    label.Text = text
+    label.Font = Enum.Font.Gotham
+    label.TextSize = 16
+    label.TextColor3 = fromPlayer and Color3.fromRGB(200,200,255) or Color3.fromRGB(240,240,240)
 
-    -- Right column: sliders and labels
-    local fovLabel = Instance.new("TextLabel", right)
-    fovLabel.Size = UDim2.new(1, 0, 0, 20)
-    fovLabel.Position = UDim2.new(0, 0, 0, 0)
-    fovLabel.BackgroundTransparency = 1
-    fovLabel.Text = "FOV: " .. tostring(CONFIG.DefaultFOV)
-    fovLabel.Font = Enum.Font.Gotham
-    fovLabel.TextSize = 14
-    fovLabel.TextColor3 = Color3.fromRGB(220,220,220)
-    fovLabel.TextXAlignment = Enum.TextXAlignment.Left
+    -- dynamic sizing
+    local textBounds = game:GetService("TextService"):GetTextSize(text, 16, label.Font, Vector2.new(360, 6000))
+    label.Size = UDim2.new(1, -12, 0, math.clamp(textBounds.Y + 8, 20, 400))
+    frame.Size = UDim2.new(1, 0, 0, label.Size.Y.Offset)
 
-    local sliderBar = Instance.new("Frame", right)
-    sliderBar.Name = "SliderBar"
-    sliderBar.Size = UDim2.new(1, 0, 0, 16)
-    sliderBar.Position = UDim2.new(0, 0, 0, 28)
-    sliderBar.BackgroundColor3 = Color3.fromRGB(50,50,60)
-    sliderBar.BorderSizePixel = 0
-    local sliderCorner = Instance.new("UICorner", sliderBar)
-    sliderCorner.CornerRadius = UDim.new(0, 8)
-
-    local knob = Instance.new("Frame", sliderBar)
-    knob.Name = "Knob"
-    knob.Size = UDim2.new(0, 24, 1, 0)
-    knob.Position = UDim2.new(0.3, -12, 0, 0)
-    knob.BackgroundColor3 = Color3.fromRGB(170,110,255)
-    knob.BorderSizePixel = 0
-    local knobCorner = Instance.new("UICorner", knob)
-    knobCorner.CornerRadius = UDim.new(0, 8)
-
-    local smoothLabel = Instance.new("TextLabel", right)
-    smoothLabel.Size = UDim2.new(1, 0, 0, 20)
-    smoothLabel.Position = UDim2.new(0, 0, 0, 56)
-    smoothLabel.BackgroundTransparency = 1
-    smoothLabel.Text = "Smooth Speed: " .. tostring(CONFIG.SmoothSpeed)
-    smoothLabel.Font = Enum.Font.Gotham
-    smoothLabel.TextSize = 14
-    smoothLabel.TextColor3 = Color3.fromRGB(220,220,220)
-    smoothLabel.TextXAlignment = Enum.TextXAlignment.Left
-
-    local smoothBar = Instance.new("Frame", right)
-    smoothBar.Name = "SmoothBar"
-    smoothBar.Size = UDim2.new(1, 0, 0, 16)
-    smoothBar.Position = UDim2.new(0, 0, 0, 84)
-    smoothBar.BackgroundColor3 = Color3.fromRGB(50,50,60)
-    local sCorner = Instance.new("UICorner", smoothBar)
-    sCorner.CornerRadius = UDim.new(0, 8)
-    local sKnob = Instance.new("Frame", smoothBar)
-    sKnob.Size = UDim2.new(0, 24, 1, 0)
-    sKnob.Position = UDim2.new(0.5, -12, 0, 0)
-    local sKnobCorner = Instance.new("UICorner", sKnob)
-    sKnobCorner.CornerRadius = UDim.new(0, 8)
-
-    -- Footer hint
-    local hint = Instance.new("TextLabel", main)
-    hint.Size = UDim2.new(1, -20, 0, 20)
-    hint.Position = UDim2.new(0, 10, 1, -28)
-    hint.BackgroundTransparency = 1
-    hint.Text = "Hold Right Mouse — assist aim. Drag the header to move this window."
-    hint.Font = Enum.Font.Gotham
-    hint.TextSize = 12
-    hint.TextColor3 = Color3.fromRGB(160,160,160)
-    hint.TextXAlignment = Enum.TextXAlignment.Left
-
-    screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
-
-    return {
-        ScreenGui = screenGui,
-        Main = main,
-        Header = header,
-        Toggle = toggleBtn,
-        AutoFire = autoFireBtn,
-        Respawn = spawnBtn,
-        ToggleMove = moveBtn,
-        SliderBar = sliderBar,
-        Knob = knob,
-        FovLabel = fovLabel,
-        SmoothLabel = smoothLabel,
-        SmoothBar = smoothBar,
-        SKnob = sKnob,
-        Close = closeBtn,
-    }
+    frame.Parent = chatArea
+    chatArea.CanvasPosition = Vector2.new(0, 999999)
 end
 
-local ui = createGui()
-
--- ====== Dummies ======
-local DummiesFolderName = "AimDummies"
-local function getFolder()
-    local folder = workspace:FindFirstChild(DummiesFolderName)
-    if not folder then
-        folder = Instance.new("Folder", workspace)
-        folder.Name = DummiesFolderName
-    end
-    return folder
-end
-
-local function clearDummies()
-    local folder = getFolder()
-    for _, v in ipairs(folder:GetChildren()) do v:Destroy() end
-end
-
-local movingTargets = false
-
-local function spawnDummies(count, radius)
-    clearDummies()
-    local folder = getFolder()
-    local origin = (LocalPlayer.Character and LocalPlayer.Character.PrimaryPart and LocalPlayer.Character.PrimaryPart.Position) or (Camera and Camera.CFrame.Position) or Vector3.new(0,5,0)
-
-    for i = 1, count do
-        local angle = math.rad((i-1) * (360/count))
-        local pos = origin + Vector3.new(math.cos(angle)*radius, math.random(2, 8), math.sin(angle)*radius)
-
-        local part = Instance.new("Part")
-        part.Size = Vector3.new(2,2,2)
-        part.Position = pos
-        part.Anchored = true
-        part.CanCollide = false
-        part.Name = "AimDummy"
-        part.Parent = folder
-
-        local beacon = Instance.new("PointLight")
-        beacon.Range = 12
-        beacon.Brightness = 2
-        beacon.Parent = part
-
-        local billboard = Instance.new("BillboardGui", part)
-        billboard.Size = UDim2.new(0, 140, 0, 36)
-        billboard.AlwaysOnTop = true
-        billboard.StudsOffset = Vector3.new(0, 2.6, 0)
-        local label = Instance.new("TextLabel", billboard)
-        label.Size = UDim2.new(1,0,1,0)
-        label.BackgroundTransparency = 1
-        label.Text = "Dummy" .. tostring(i)
-        label.TextColor3 = Color3.fromRGB(240,240,240)
-        label.Font = Enum.Font.Gotham
-        label.TextSize = 16
-
-        -- attach a small frame for box-esp simulation
-        local box = Instance.new("BillboardGui", part)
-        box.Size = UDim2.new(0, 80, 0, 80)
-        box.AlwaysOnTop = true
-        local boxFrame = Instance.new("Frame", box)
-        boxFrame.Size = UDim2.new(1,0,1,0)
-        boxFrame.BackgroundTransparency = 0.6
-        boxFrame.BackgroundColor3 = Color3.fromRGB(255,80,80)
-        local boxCorner = Instance.new("UICorner", boxFrame)
-        boxCorner.CornerRadius = UDim.new(0, 8)
-
-        -- store custom attributes
-        part:SetAttribute("BasePos", part.Position)
-        part:SetAttribute("MoveOffset", Vector3.new(0,0,0))
-    end
-end
-
-spawnDummies(CONFIG.DummyCount, CONFIG.DummyDistance)
-
--- ====== Aim logic ======
-local enabled = false
-local holding = false
-local fovPixels = CONFIG.DefaultFOV
-local smoothSpeed = CONFIG.SmoothSpeed
-local autoFire = false
-
-local function isInScreenFOV(targetPos, fovPixels)
-    local screenPos, onScreen = Camera:WorldToViewportPoint(targetPos)
-    if not onScreen then return false, nil end
-    local centerX, centerY = Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2
-    local dx = screenPos.X - centerX
-    local dy = screenPos.Y - centerY
-    local dist = math.sqrt(dx*dx + dy*dy)
-    return dist <= fovPixels, screenPos
-end
-
-local function getClosestDummy()
-    local best
-    local bestDist = math.huge
-    local dummies = getFolder()
-    for _, part in ipairs(dummies:GetChildren()) do
-        if part:IsA("BasePart") then
-            local ok, screenPos = isInScreenFOV(part.Position, fovPixels)
-            if ok then
-                local dx = screenPos.X - Camera.ViewportSize.X/2
-                local dy = screenPos.Y - Camera.ViewportSize.Y/2
-                local dist = math.sqrt(dx*dx + dy*dy)
-                if dist < bestDist then
-                    bestDist = dist
-                    best = part
-                end
-            end
-        end
-    end
-    return best
-end
-
-local function smoothLookAt(targetPos, dt)
-    local camPos = Camera.CFrame.Position
-    local desired = CFrame.new(camPos, targetPos)
-    local current = Camera.CFrame
-    local alpha = clamp(smoothSpeed * dt, 0, 1)
-    Camera.CFrame = current:Lerp(desired, alpha)
-end
-
--- Simulated auto-fire (only prints + optional visual flash)
-local function simulateFire()
-    -- we keep this local and visual only; not sending any server events
-    local flash = Instance.new("Part")
-    flash.Size = Vector3.new(0.2,0.2,0.2)
-    flash.Anchored = true
-    flash.CanCollide = false
-    flash.Transparency = 0.5
-    flash.Material = Enum.Material.Neon
-    flash.Color = Color3.fromRGB(255,200,80)
-    flash.Parent = workspace
-    local camPos = Camera.CFrame * CFrame.new(0,0,-2)
-    flash.Position = camPos.Position
-    game:GetService("Debris"):AddItem(flash, 0.08)
-end
-
--- ====== Dragging window ======
+-- Draggable by header: corner-drag behavior (hold to drag top-left 28x28 px)
 local dragging = false
-local dragOffset = Vector2.new(0,0)
-local function makeDraggable(frame, dragHandle)
-    dragHandle.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = true
-            local mouse = LocalPlayer:GetMouse()
-            local pos = frame.AbsolutePosition
-            dragOffset = Vector2.new(mouse.X - pos.X, mouse.Y - pos.Y)
-        end
-    end)
-    UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = false
-        end
-    end)
-    RunService.RenderStepped:Connect(function()
-        if dragging then
-            local mouse = LocalPlayer:GetMouse()
-            local newX = mouse.X - dragOffset.X
-            local newY = mouse.Y - dragOffset.Y
-            frame.Position = UDim2.new(0, newX, 0, newY)
-        end
-    end)
-end
+local dragOffset = Vector2.new()
+local cornerSize = Vector2.new(28,28)
 
-makeDraggable(ui.Main, ui.Header)
-
--- ====== UI interactions ======
-ui.Toggle.MouseButton1Click:Connect(function()
-    enabled = not enabled
-    ui.Toggle.Text = enabled and "Aimbot: ON" or "Enable Aimbot"
-    ui.Toggle.BackgroundColor3 = enabled and Color3.fromRGB(30,150,100) or Color3.fromRGB(42,42,54)
-end)
-
-ui.AutoFire.MouseButton1Click:Connect(function()
-    autoFire = not autoFire
-    ui.AutoFire.Text = autoFire and "Auto-Fire: ON" or "Auto-Fire (simulated)"
-    ui.AutoFire.BackgroundColor3 = autoFire and Color3.fromRGB(200,80,80) or Color3.fromRGB(42,42,54)
-end)
-
-ui.Respawn.MouseButton1Click:Connect(function()
-    spawnDummies(CONFIG.DummyCount, CONFIG.DummyDistance)
-end)
-
-ui.ToggleMove.MouseButton1Click:Connect(function()
-    movingTargets = not movingTargets
-    ui.ToggleMove.Text = movingTargets and "Moving Targets: ON" or "Toggle Moving Targets"
-    ui.ToggleMove.BackgroundColor3 = movingTargets and Color3.fromRGB(80,140,220) or Color3.fromRGB(42,42,54)
-end)
-
-ui.Close.MouseButton1Click:Connect(function()
-    ui.ScreenGui.Enabled = false
-end)
-
--- Slider drag behavior for FOV
-local fovDragging = false
-ui.Knob.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then fovDragging = true end
-end)
-UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then fovDragging = false end
-end)
-
--- Smooth speed knob drag
-local sDragging = false
-ui.SKnob.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then sDragging = true end
-end)
-UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then sDragging = false end
-end)
-
-RunService.RenderStepped:Connect(function()
-    if fovDragging then
-        local mouse = LocalPlayer:GetMouse()
-        local bar = ui.SliderBar
-        local relativeX = clamp(mouse.X - bar.AbsolutePosition.X, 0, bar.AbsoluteSize.X)
-        local sliderPos = relativeX / bar.AbsoluteSize.X
-        ui.Knob.Position = UDim2.new(sliderPos, -12, 0, 0)
-        fovPixels = math.floor(30 + sliderPos * 250) -- 30..280 pixels
-        ui.FovLabel.Text = "FOV: " .. tostring(fovPixels)
-    end
-    if sDragging then
-        local mouse = LocalPlayer:GetMouse()
-        local bar = ui.SmoothBar
-        local relativeX = clamp(mouse.X - bar.AbsolutePosition.X, 0, bar.AbsoluteSize.X)
-        local sliderPos = relativeX / bar.AbsoluteSize.X
-        ui.SKnob.Position = UDim2.new(sliderPos, -12, 0, 0)
-        smoothSpeed = math.floor(1 + sliderPos * 40) -- 1..41
-        ui.SmoothLabel.Text = "Smooth Speed: " .. tostring(smoothSpeed)
-    end
-end)
-
--- Input for holding right mouse
 UserInputService.InputBegan:Connect(function(input, processed)
     if processed then return end
-    if input.UserInputType == Enum.UserInputType.MouseButton2 then
-        holding = true
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        local mouse = Players.LocalPlayer:GetMouse()
+        local relX = mouse.X - main.AbsolutePosition.X
+        local relY = mouse.Y - main.AbsolutePosition.Y
+        if relX >= 0 and relY >= 0 and relX <= cornerSize.X and relY <= cornerSize.Y then
+            dragging = true
+            dragOffset = Vector2.new(relX, relY)
+        end
     end
 end)
 UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton2 then
-        holding = false
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = false
+    end
+end)
+RunService.RenderStepped:Connect(function()
+    if dragging then
+        local mouse = Players.LocalPlayer:GetMouse()
+        local newX = mouse.X - dragOffset.X
+        local newY = mouse.Y - dragOffset.Y
+        -- keep on screen
+        local maxX = Camera.ViewportSize.X - main.AbsoluteSize.X
+        local maxY = Camera.ViewportSize.Y - main.AbsoluteSize.Y
+        newX = math.clamp(newX, 0, math.max(0, maxX))
+        newY = math.clamp(newY, 0, math.max(0, maxY))
+        main.Position = UDim2.new(0, newX, 0, newY)
     end
 end)
 
--- ====== Moving Dummies Behavior =====
-RunService.Heartbeat:Connect(function(dt)
-    if movingTargets then
-        local folder = getFolder()
-        for i, part in ipairs(folder:GetChildren()) do
-            if part:IsA("BasePart") then
-                local base = part:GetAttribute("BasePos") or part.Position
-                local t = tick() + i * 0.7
-                local offset = Vector3.new(math.sin(t*0.8 + i)*2, math.cos(t*0.6 + i)*1.2, math.sin(t*0.9 + i)*2)
-                part.Position = base + offset
-            end
-        end
-    else
-        -- ensure anchored back to base pos
-        local folder = getFolder()
-        for _, part in ipairs(folder:GetChildren()) do
-            if part:IsA("BasePart") then
-                local base = part:GetAttribute("BasePos")
-                if base then part.Position = base end
-            end
-        end
-    end
-end)
+-- Send request to server and await response
+local function sendQuery(text)
+    if type(text) ~= "string" or text:match("^%s*$") then return end
+    addBubble(text, true)
+    inputBox.Text = ""
 
--- ====== Main aim loop =====
-RunService.RenderStepped:Connect(function(dt)
-    if enabled and holding then
-        local target = getClosestDummy()
-        if target then
-            smoothLookAt(target.Position, dt)
-            if autoFire then
-                simulateFire()
-            end
-        end
-    end
-end)
-
--- Auto respawn safety
-if CONFIG.AutoRespawn then
-    workspace.ChildRemoved:Connect(function(child)
-        if child.Name == DummiesFolderName then
-            spawnDummies(CONFIG.DummyCount, CONFIG.DummyDistance)
-        end
+    -- invoke server
+    local ok, res = pcall(function()
+        return ChatRequestFunction:InvokeServer(text)
     end)
+
+    if not ok then
+        addBubble("ข้อผิดพลาดเชื่อมต่อ: " .. tostring(res), false)
+        return
+    end
+
+    if not res.ok then
+        addBubble("Error: " .. tostring(res.error), false)
+        return
+    end
+
+    addBubble(tostring(res.text), false)
 end
 
--- Cleanup on leave
-LocalPlayer.AncestryChanged:Connect(function()
-    if not LocalPlayer:IsDescendantOf(game) then
-        local gui = LocalPlayer:FindFirstChild("PlayerGui")
-        if gui then
-            local g = gui:FindFirstChild("AimTrainUI")
-            if g then g:Destroy() end
-        end
+-- Input events
+inputBox.FocusLost:Connect(function(enter)
+    if enter then
+        local txt = inputBox.Text
+        sendQuery(txt)
     end
 end)
 
--- End of script
+closeBtn.MouseButton1Click:Connect(function()
+    local visible = screenGui.Enabled
+    screenGui.Enabled = not visible
+end)
+
+-- Parent the GUI
+screenGui.Parent = PlayerGui
+]]-- end client UI
+
+-- -----------------------------------------------------------------------------
+-- END OF FILE
+-- -----------------------------------------------------------------------------
+-- Reminder: Paste each marked section into the correct Roblox asset and configure
+-- OpenAIModule.API_KEY and OpenAIModule.MODEL on the server module. Test in Studio
+-- with HttpService enabled. Implement additional security, caching, and rate-limits
+-- for production.
+-- -----------------------------------------------------------------------------
